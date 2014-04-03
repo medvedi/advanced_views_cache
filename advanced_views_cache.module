@@ -1,0 +1,548 @@
+  <?php
+
+/**
+ * @file
+ * Advanced views cache cache.
+ */
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function advanced_views_cache_ctools_plugin_directory($module, $plugin) {
+  return 'plugins/' . $plugin;
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * We will alter views ajax callback for cache implementing.
+ */
+function advanced_views_cache_menu_alter(&$items) {
+  if ($items['views/ajax']) {
+    $items['views/ajax']['page callback'] = 'advanced_views_cache_data_cache';
+    $items['views/ajax']['file'] = 'advanced_views_cache.module';
+    $items['views/ajax']['file path'] = drupal_get_path('module', 'advanced_views_cache');
+  }
+}
+
+/**
+ * Menu callback to load a view via AJAX.
+ *
+ * Borrowed from views/includes/ajax.inc.
+ * In basic ajax functionality was added cache system.
+ * @see advanced_views_cache_preprocess_pager_link()
+ */
+function advanced_views_cache_data_cache() {
+  global $language;
+  module_load_include('inc', 'views', 'includes/ajax');
+
+  if (isset($_REQUEST['view_name']) && isset($_REQUEST['view_display_id'])) {
+
+    $name = $_REQUEST['view_name'];
+    $display_id = $_REQUEST['view_display_id'];
+    $args = isset($_REQUEST['view_args']) && $_REQUEST['view_args'] !== '' ? explode('/', $_REQUEST['view_args']) : array();
+    $path = isset($_REQUEST['view_path']) ? rawurldecode($_REQUEST['view_path']) : NULL;
+    $dom_id = isset($_REQUEST['view_dom_id']) ? preg_replace('/[^a-zA-Z0-9_-]+/', '-', $_REQUEST['view_dom_id']) : NULL;
+    $pager_element = isset($_REQUEST['pager_element']) ? intval($_REQUEST['pager_element']) : NULL;
+    $exposed_filter = isset($_REQUEST['tags']) ? $_REQUEST['tags'] : NULL;
+
+    // Get views queries if exist.
+    // Relevant for shop page.
+    $f = isset($_REQUEST['f']) ? implode($_REQUEST['f']) : NULL;
+    $sort = isset($_REQUEST['sort']) ? $_REQUEST['sort'] : NULL;
+    $order = isset($_REQUEST['order']) ? $_REQUEST['order'] : NULL;
+
+    // Remove all of this stuff from $_GET so it doesn't end up in pagers and
+    // tablesort URLs.
+    $query_params = array('view_name', 'view_display_id', 'view_args', 'view_path',
+      'view_dom_id', 'pager_element', 'view_base_path', 'ajax_html_ids', 'ajax_page_state');
+    foreach ($query_params as $key) {
+      if (isset($_GET[$key])) {
+        unset($_GET[$key]);
+      }
+      if (isset($_REQUEST[$key])) {
+        unset($_REQUEST[$key]);
+      }
+      if (isset($_POST[$key])) {
+        unset($_POST[$key]);
+      }
+    }
+
+    // Fix 'q' for paging.
+    if (!empty($path)) {
+      $_GET['q'] = $path;
+    }
+
+    // Add all $_POST data, because AJAX is always a post and many things,
+    // such as tablesorts, exposed filters and paging assume $_GET.
+    $_GET = $_POST + $_GET;
+    // Overwrite the destination.
+    // @see drupal_get_destination()
+    $origin_destination = $path;
+    $query = drupal_http_build_query($_REQUEST);
+    if ($query != '') {
+      $origin_destination .= '?' . $query;
+    }
+    $destination = &drupal_static('drupal_get_destination');
+    $destination = array('destination' => $origin_destination);
+
+    // Create $hash_cid for each new request.
+    // If the view is user-specific save using "user/ID" prefix.
+    $cache_prefix = $cache_suffix = '';
+    $cache_meta = advanced_views_cache_get_cached_views($name . ':' . $display_id);
+    // Check if context is present and use it if necessary.
+    if ($cache_meta) {
+      if ($cache_meta['cache_type'] == 'user' && !empty($_GET['context'])) {
+        $cache_prefix = 'user/' . (int) $_GET['context'] . ':';
+      }
+      if (!empty($cache_meta['path_context'])) {
+        $cache_suffix = ':' . $path;
+      }
+      // Anonymous content may differ from authenticated - store it separately
+      // because Ajax POST calls are not cached for anonymous.
+      // @todo: make this optional?
+      if (user_is_anonymous()) {
+        $cache_suffix .= ':anon';
+      }
+    }
+    $hash_cid = $cache_prefix . $name . ':' . $display_id . ':' . $language->language . $cache_suffix . ':' . $_POST['page'];
+
+    // Add specific attributes if exist.
+    if (!$sort && $f) {
+      $hash_cid .= ':' . $f;
+    }
+    elseif ($sort && !$f) {
+      $hash_cid .= ':' . $sort . ':' . $order;
+    }
+    elseif ($sort && $f) {
+      $hash_cid .= ':' . $sort . ':' . $order . ':' . $f;
+    }
+    elseif (!$sort && !$f && $order) {
+      $hash_cid .= ':' . $order;
+    }
+    elseif ($exposed_filter) {
+      $hash_cid .= str_replace(',', '', str_replace(' ', '', $exposed_filter));
+    }
+
+    // CUSTOM CODE BEGIN
+    // Blog list query parametr.
+    foreach ($_REQUEST as $key => $value) {
+      if (strpos($key,'arkiv') !== false) {
+        $hash_cid .= ':' . $key;
+      }
+    }
+    // CUSTOM CODE END
+
+    // Check if we are allowed to cache this view. Right now checks are based on
+    // sort and view name but can be easily extended by adding more conditions
+    // to advanced_views_cache_allowed()'s switch.
+    $cache = FALSE;
+    if (advanced_views_cache_allowed($sort) && advanced_views_cache_allowed($name)) {
+      // Let's try to create our $cid. We won't use md5() for our $cid, in case
+      // that we will use wildcard for expire.
+      $cid = $hash_cid;
+      // Try to load data from the cache.
+      $cache = cache_get($cid, 'cache_views_ajax');
+
+      if ($cache) {
+        // Allow other module react/alter cache before it is returned.
+        foreach (module_implements('advanced_views_cache_get') as $module) {
+          $function = $module . '_advanced_views_cache_get';
+          $function($name, $display_id, $cache);
+        }
+      }
+    }
+
+    if ($cache) {
+      $output = $cache->data['output'];
+      // For each new request we'll check dom_id,
+      // and it's very IMPORTANT to use relevant one.
+      $old_selectror = str_replace('.', '', $output['#commands'][1]['selector']);
+      $output['#commands'][1]['selector'] = '.view-dom-id-' . $dom_id;
+      $output['#commands'][1]['data'] = str_replace($old_selectror, 'view-dom-id-' . $dom_id, $output['#commands'][1]['data']);
+    }
+    else {
+      $commands = array();
+      // Load the view.
+      $view = views_get_view($name);
+      if ($view && $view->access($display_id)) {
+        // Override the display's pager_element with the one actually used.
+        if (isset($pager_element)) {
+          $commands[] = views_ajax_command_scroll_top('.view-dom-id-' . $dom_id);
+          $view->display[$display_id]->handler->set_option('pager_element', $pager_element);
+        }
+        // Reuse the same DOM id so it matches that in Drupal.settings.
+        $view->dom_id = $dom_id;
+        $commands[] = ajax_command_replace('.view-dom-id-' . $dom_id, $view->preview($display_id, $args));
+      }
+      drupal_alter('views_ajax_data', $commands, $view);
+
+      $cache = array(
+        'output' => array('#type' => 'ajax', '#commands' => $commands),
+        'result' => advanced_views_cache_get_result_nids($view),
+      );
+
+      // We do not create cache for recommended content. That's why cache won't
+      // be set.
+      if (advanced_views_cache_allowed($sort) && advanced_views_cache_allowed($name)) {
+        // Cache the data, if it is not already in the cache.
+        // @todo: call advanced_views_cache_set hook?
+        cache_set($cid, $cache, 'cache_views_ajax', advanced_views_cache_get_view_expire($name, $display_id));
+      }
+      $output = $cache['output'];
+    }
+    return $output;
+  }
+}
+
+/**
+ * Return true or false if certain condition for ajax view caching is fulfilled.
+ * @todo: make it a hook and move to relevant modules or think of a better way
+ * to not cache certain views.
+ */
+function advanced_views_cache_allowed($condition) {
+  $nocache_conditions = module_invoke_all('advanced_views_nocache_conditions');
+  if (in_array($condition, $nocache_conditions)) {
+    return FALSE;
+  } else {
+    return TRUE;
+  }
+}
+
+/**
+ * Returns false if there are modules that prohibit cache clear on entity operations.
+ */
+function advanced_views_cache_clear_allowed($node) {
+  // Allow other modules to disable cache clear on node operations.
+  foreach (module_implements('advanced_views_cache_clear_allowed') as $module) {
+    $function = $module . '_advanced_views_cache_clear_allowed';
+    $allow = $function($node);
+    if (!$allow) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function advanced_views_cache_node_insert($node) {
+  advanced_views_cache_clear_entity_caches($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function advanced_views_cache_node_update($node) {
+  advanced_views_cache_clear_entity_caches($node);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function advanced_views_cache_node_delete($node) {
+  advanced_views_cache_clear_entity_caches($node);
+}
+
+/**
+ * Clears views that contain relevant Drupal entities.
+ */
+function advanced_views_cache_clear_entity_caches($entity) {
+  if (!advanced_views_cache_clear_allowed($entity)) {
+    return;
+  }
+
+  $cached_views = advanced_views_cache_get_cached_views();
+  foreach ($cached_views as $view => $cache) {
+    // Clear only those views which trigger is set to entity.
+    if (in_array('entity', $cache['clear_trigger'])) {
+      // Entity is node and its type is allowed to be cleared.
+      if (isset($entity->type) && in_array($entity->type, $cache['entity_types'])) {
+        // Determine which type of cache has to be cleared.
+        if ($cache['cache_type'] == 'user') {
+          if (!empty($cache['cid_clear_callback'])) {
+            $cid_callback = $cache['cid_clear_callback'];
+            $cid = $cid_callback($view, $entity);
+          }
+          // Here we rely on the fact that user specific list of nodes is
+          // generated based on user owning relation to the content being
+          // inserted/updated/deleted.
+          else {
+            $cid = 'user/' . $entity->uid . ':' . $view . ':';
+          }
+        }
+        // Path based cache doesn't give us any details about which path has to be expired.
+        // so we assume a node path by default (seems to be ok for most of the cases)
+        // or call custom CID generation callback if provided.
+        elseif (!empty($cache['path_context'])) {
+          if (!empty($cache['cid_clear_callback'])) {
+            $cid_callback = $cache['cid_clear_callback'];
+            $cid = $cid_callback($view, $entity);
+          }
+          else {
+            $cid = $view . ':node/' . $entity->nid;
+          }
+        }
+        else {
+          $cid = $view . ':' . ($entity->language != 'und' ? $entity->language : '');
+        }
+
+        // Allow other modules to react on cache expiration.
+        foreach (module_implements('advanced_views_cache_clear') as $module) {
+          $function = $module . '_advanced_views_cache_clear';
+          $function($view, $cache, $entity);
+        }
+
+        cache_clear_all($cid, 'cache_views_ajax', TRUE);
+      }
+      // @todo: support for user entities.
+      // else () {}
+    }
+  }
+}
+
+/**
+ * Implements hook_flag().
+ *
+ * This hook is implemented mainly to expire views that contain information
+ * about a flag (number of likes, favorites etc.).
+ */
+function advanced_views_cache_flag($op, $flag, $content_id, $account, $fcid) {
+  $cached_views = advanced_views_cache_get_cached_views();
+  foreach ($cached_views as $view => $cache) {
+    $cid = NULL;
+    // Clear only those views which trigger is set to 'flag'.
+    if (in_array('flag', $cache['clear_trigger'])) {
+      // Load the flagged entity. It is loaded from static cache because flag
+      // module has already loaded it in order to determine permissions.
+      $entity = $flag->fetch_content($content_id);
+      // Flagged item is node.
+      if (isset($entity->type)) {
+        // View is showing nodes.
+        if (in_array($entity->type, $cache['entity_types'])) {
+          // Clear user specific cache of nodes for currently flagging/unflagging account.
+          if ($cache['cache_type'] == 'user') {
+            $cid = 'user/' . $account->uid . ':' . $view . ':';
+          }
+          else {
+            $cid = $view . ':';
+          }
+        }
+        // View is showing users.
+        elseif (in_array('user', $cache['entity_types']) && !empty($cache['path_context'])) {
+          // Here we assume that current user flagged a node and node's landing page
+          // shows a list of users who flagged it, and should be expired,
+          // or call custom CID generation callback if provided.
+          if (!empty($cache['cid_clear_callback'])) {
+            $cid_callback = $cache['cid_clear_callback'];
+            $cid = $cid_callback($view, $entity);
+          }
+          else {
+            $cid = $view . ':node/' . $content_id;
+          }
+        }
+      }
+      // Flagged item is user.
+      elseif (in_array('user', $cache['entity_types']) && isset($entity->uid)) {
+        if ($cache['cache_type'] == 'user') {
+          if ($cache['flag_action_type'] == 'active') {
+            $cid = 'user/' . $account->uid . ':' . $view . ':';
+          }
+          elseif ($cache['flag_action_type'] == 'passive') {
+            $cid = 'user/' . $content_id . ':' . $view . ':';
+          }
+        }
+        else {
+          $cid = $view . ':';
+        }
+      }
+
+      // @todo: allow other modules to react on cache expiration triggered by flags.
+
+      if (!empty($cid)) {
+        cache_clear_all($cid, 'cache_views_ajax', TRUE);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function advanced_views_cache_flush_caches() {
+  return array('cache_views_ajax');
+}
+
+/**
+ * Implements hook_views_post_execute().
+ *
+ * We need to save cached view's results in order to access them later in our
+ * panels cache plugin.
+ */
+function advanced_views_cache_views_post_execute(&$view) {
+  $result = &drupal_static('advanced_views_cache_last_result', array());
+  $view_id = $view->name . ':' . $view->current_display;
+  $view_cache = advanced_views_cache_get_cached_views($view_id);
+  if ($view_cache) {
+    if (in_array('user', $view_cache['entity_types'])) {
+      $result = advanced_views_cache_get_result_uids($view);
+    }
+    else {
+      $result = advanced_views_cache_get_result_nids($view);
+    }
+  }
+}
+
+/**
+ * Extracts node IDs out of view result.
+ * Note: the view must be configured to render entities (content) not fields.
+ * @todo: this code probably handles search_api-related specifics and should be revised.
+ */
+function advanced_views_cache_get_result_nids($view) {
+  // We do not save the whole result here but only nids.
+  // This may be not an ideal solution, but it seems to be enough at the moment.
+  $result = array();
+  foreach ($view->result as $item) {
+    if (isset($item->entity)) {
+      if (is_int($item->entity)) {
+        $result[] = $item->entity;
+      }
+      elseif (is_object($item->entity)) {
+        $result[] = $item->entity->nid;
+      }
+    }
+    elseif (isset($item->nid)) {
+      $result[] = $item->nid;
+    }
+  }
+  return $result;
+}
+
+/**
+ * Extracts user IDs out of view result.
+ * Note: the view must be configured to render entities not fields.
+ * @todo: this code probably handles search_api-related specifics and should be revised.
+ */
+function advanced_views_cache_get_result_uids($view) {
+  // We do not save the whole result here but only uids.
+  // This may be not an ideal solution, but it seems to be enough at the moment.
+  $result = array();
+  foreach ($view->result as $item) {
+    if (isset($item->entity)) {
+      if (is_int($item->entity)) {
+        $result[] = $item->entity;
+      }
+      elseif (is_object($item->entity)) {
+        $result[] = $item->entity->uid;
+      }
+    }
+    elseif (isset($item->uid)) {
+      $result[] = $item->uid;
+    }
+  }
+  return $result;
+}
+
+/**
+ * Calculate a timestamp that determines expiration time for a given display.
+ */
+function advanced_views_cache_get_view_expire($view_name, $view_display) {
+  $expire = CACHE_PERMANENT;
+  $view_meta = advanced_views_cache_get_cached_views($view_name . ':' . $view_display);
+  if ($view_meta && !empty($view_meta['lifetime'])) {
+    $expire = time() + intval($view_meta['lifetime']);
+  }
+  return $expire;
+}
+
+/**
+ * Determine the entity type that a given display returns in its result set.
+ */
+function advanced_views_cache_get_view_entity_type($view_name, $view_display) {
+  $view_meta = advanced_views_cache_get_cached_views($view_name . ':' . $view_display);
+  if ($view_meta) {
+    return $view_meta['entity_types'] == array('user') ? 'user' : 'node';
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Validates views definition.
+ *
+ * Also prepares them to be well-formed and easily accessible from static cache
+ * on multiple calls.
+ */
+function advanced_views_cache_get_cached_views($view_name = NULL) {
+  static $views;
+
+  if (empty($views)) {
+    $cached_views = module_invoke_all('advanced_views_cached_views');
+    foreach ($cached_views as $view => $cache) {
+      // Check cache type.
+      if (!isset($cache['cache_type'])) {
+        $cache['cache_type'] = 'global';
+      }
+      elseif (!in_array($cache['cache_type'], array('user', 'global'))) {
+        throw new Exception("Wrong cache type {$cache['cache_type']} set for view $view");
+      }
+      // Check entity types.
+      if (!isset($cache['entity_types'])) {
+        throw new Exception("Missing entity type for view $view");
+      }
+      elseif (!is_array($cache['entity_types'])) {
+        $cache['entity_types'] = array($cache['entity_types']);
+      }
+      else {
+        if (count($cache['entity_types']) > 1 && in_array('user', $cache['entity_types'])) {
+          throw new Exception("Invalid settings for view $view. Views can't combine both node and user entity types.");
+        }
+      }
+      // Check clear trigger.
+      if (!isset($cache['clear_trigger'])) {
+        $cache['clear_trigger'] = array('entity');
+      }
+      elseif (!is_array($cache['clear_trigger'])) {
+        $cache['clear_trigger'] = array($cache['clear_trigger']);
+        if (!array_intersect($cache['clear_trigger'], array('entity', 'flag'))) {
+          throw new Exception("Wrong cache clear trigger(s) " . implode(', ', $cache['cache_type']) . " set for view $view");
+        }
+      }
+      // Check flag action type.
+      if (in_array('flag', $cache['clear_trigger'])) {
+        if (!isset($cache['flag_action_type'])) {
+          $cache['flag_action_type'] = 'active';
+        }
+        elseif (!in_array($cache['flag_action_type'], array('active', 'passive'))) {
+          throw new Exception("Invalid flag action type {$cache['flag_action_type']} set for view $view");
+        }
+      }
+      // Check cid callback.
+      if (!empty($cache['cid_clear_callback']) && !function_exists($cache['cid_clear_callback'])) {
+        throw new Exception("Undefined cid clear callback {$cache['cid_clear_callback']} set for view $view");
+      }
+      $views[$view] = $cache;
+    }
+  }
+
+  if ($view_name) {
+    return isset($views[$view_name]) ? $views[$view_name] : NULL;
+  }
+  return $views;
+}
+
+/**
+ * Implements hook_preprocess_pager_link().
+ *
+ * For 'user' cache type we have to transfer context (user whose content is
+ * being viewed).
+ */
+function advanced_views_cache_preprocess_pager_link(&$variables) {
+  $cache_context = drupal_static('advanced_views_cache_context', 0);
+  if ($cache_context) {
+    $variables['parameters']['context'] = $cache_context;
+    drupal_static_reset('advanced_views_cache_context');
+  }
+}
