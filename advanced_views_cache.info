@@ -1,0 +1,13 @@
+name = Advanced views cache
+description = Provides a views cache plugin based on load more functionality.
+package = STYLISTA
+core = 7.x
+dependencies[] = views
+dependencies[] = views_load_more
+dependencies[] = ctools
+
+; Views plugins
+files[] = views/advanced_views_cache_plugin_cache.inc
+
+; Context plugins
+files[] = plugins/advanced_views_cache/base.inc
